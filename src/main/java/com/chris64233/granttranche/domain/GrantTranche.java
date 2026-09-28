@@ -103,6 +103,14 @@ public class GrantTranche {
         return plannedAmount;
     }
 
+    /**
+     * 更新计划金额。仅允许在期次尚未拨付（无任何已批准拨款）时，由预算调整在同一事务内等额转移；
+     * 已支付、正在拨付或用于追回的金额不属于计划金额，不会也不能被移动。
+     */
+    public void setPlannedAmount(BigDecimal plannedAmount) {
+        this.plannedAmount = plannedAmount;
+    }
+
     public String getRequiredDeliverable() {
         return requiredDeliverable;
     }

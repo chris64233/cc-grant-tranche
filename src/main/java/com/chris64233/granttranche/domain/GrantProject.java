@@ -9,6 +9,7 @@ import jakarta.persistence.OneToMany;
 import jakarta.persistence.OrderBy;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
+import jakarta.persistence.Version;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -46,6 +47,14 @@ public class GrantProject {
     /** 已支付拨款的追回总额。 */
     @Column(name = "total_recovered", nullable = false, precision = 19, scale = 2)
     private BigDecimal totalRecovered = BigDecimal.ZERO;
+
+    /**
+     * JPA 乐观版本。所有改变项目一致性状态的事务（拨款、支付、撤销、追回、预算调整确认）
+     * 都会使版本递增；预算调整确认据此与并发的拨款确认裁决，落败方整体回滚。
+     */
+    @Version
+    @Column(nullable = false)
+    private Long version = 0L;
 
     @OneToMany(mappedBy = "project")
     @OrderBy("sequenceNo ASC")
@@ -95,6 +104,10 @@ public class GrantProject {
 
     public void setTotalRecovered(BigDecimal totalRecovered) {
         this.totalRecovered = totalRecovered;
+    }
+
+    public Long getVersion() {
+        return version;
     }
 
     public List<GrantTranche> getTranches() {

@@ -1,5 +1,6 @@
 package com.chris64233.granttranche.service;
 
+import com.chris64233.granttranche.domain.BudgetAdjustment;
 import com.chris64233.granttranche.domain.FundRecord;
 import com.chris64233.granttranche.domain.FundRecordStatus;
 import com.chris64233.granttranche.domain.FundRecordType;
@@ -7,6 +8,7 @@ import com.chris64233.granttranche.domain.GrantProject;
 import com.chris64233.granttranche.domain.GrantTranche;
 import com.chris64233.granttranche.domain.TrancheStatus;
 import com.chris64233.granttranche.dto.CreateProjectRequest;
+import com.chris64233.granttranche.repo.BudgetAdjustmentRepository;
 import com.chris64233.granttranche.repo.ComplianceSuspensionRepository;
 import com.chris64233.granttranche.repo.FundRecordRepository;
 import com.chris64233.granttranche.repo.GrantProjectRepository;
@@ -27,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * 并发一致性测试：在真实线程 + 真实事务 + H2 行锁下验证
@@ -45,6 +48,8 @@ class GrantConcurrencyTest {
     private FundRecordRepository fundRecordRepository;
     @Autowired
     private ComplianceSuspensionRepository suspensionRepository;
+    @Autowired
+    private BudgetAdjustmentRepository adjustmentRepository;
     @Autowired
     private TransactionTemplate transactionTemplate;
 
@@ -364,5 +369,105 @@ class GrantConcurrencyTest {
         assertThat(reloaded.getTotalDisbursed()).isEqualByComparingTo(effectiveDisbursed);
         assertThat(reloaded.getTotalRecovered()).isEqualByComparingTo(recovered);
         assertThat(reloaded.getTotalDisbursed()).isLessThanOrEqualTo(reloaded.getApprovedAmount());
+    }
+
+    /**
+     * 确定性地制造"拨款确认"与"预算调整确认"真正重叠：第三个屏障事务先持有项目行锁，
+     * 使拨款线程与调整确认线程都在持锁前读到同一旧版本，随后阻塞在同一把行锁上；
+     * 屏障提交后两者抢锁，先到者成功并推进项目版本，后到者在版本守卫处被拒（409）。
+     * 因此恰好一个成功，且两个期次计划金额合计始终为 100，无半成功状态。
+     */
+    @Test
+    void overlappingDisburseAndAdjustmentExactlyOneWins() throws Exception {
+        GrantProject project = createProject("C-ADJ", "100", "40", "60");
+        List<GrantTranche> tranches = trancheRepository
+                .findByProjectIdOrderBySequenceNoAsc(project.getId());
+        accept(tranches.get(0).getId());
+        BudgetAdjustment adjustment = grantService.requestAdjustment(
+                tranches.get(0).getId(), tranches.get(1).getId(), new BigDecimal("10"),
+                "C-ADJ-1", "与拨款真重叠", "manager-qian");
+
+        ExecutorService pool = Executors.newFixedThreadPool(3);
+        CountDownLatch inside = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch start = new CountDownLatch(1);
+
+        // 屏障事务：先占住项目行锁，直到两个工作线程都已读到旧版本并阻塞在锁上。
+        Future<?> barrier = pool.submit(() -> transactionTemplate.executeWithoutResult(s -> {
+            projectRepository.findByIdForUpdate(project.getId());
+            inside.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }));
+        inside.await(10, TimeUnit.SECONDS);
+
+        Future<?> disburseFuture = pool.submit(() -> {
+            start.await();
+            grantService.disburse(tranches.get(0).getId(), "C-ADJ-D", "approver", "重叠拨款");
+            return null;
+        });
+        Future<?> confirmFuture = pool.submit(() -> {
+            start.await();
+            grantService.confirmAdjustment(adjustment.getId(), "approver");
+            return null;
+        });
+        // 给两个工作线程足够时间：完成"读旧版本"并阻塞在屏障持有的行锁上。
+        Thread.sleep(500);
+        start.countDown();
+        Thread.sleep(200);
+        release.countDown();
+
+        boolean disburseOk;
+        boolean confirmOk;
+        try {
+            disburseFuture.get(15, TimeUnit.SECONDS);
+            disburseOk = true;
+        } catch (Exception e) {
+            disburseOk = false;
+        }
+        try {
+            confirmFuture.get(15, TimeUnit.SECONDS);
+            confirmOk = true;
+        } catch (Exception e) {
+            confirmOk = false;
+        }
+        barrier.get(15, TimeUnit.SECONDS);
+        pool.shutdownNow();
+
+        assertThat(disburseOk ^ confirmOk)
+                .as("真正重叠时拨款确认与预算调整确认恰好一个成功 (disburse=%s, confirm=%s)",
+                        disburseOk, confirmOk)
+                .isTrue();
+
+        GrantProject reloaded = projectRepository.findById(project.getId()).orElseThrow();
+        List<GrantTranche> after = trancheRepository.findByProjectIdOrderBySequenceNoAsc(project.getId());
+        assertThat(after.get(0).getPlannedAmount().add(after.get(1).getPlannedAmount()))
+                .isEqualByComparingTo("100");
+        assertThat(reloaded.getTotalDisbursed())
+                .isLessThanOrEqualTo(reloaded.getApprovedAmount());
+
+        if (disburseOk) {
+            // 拨款赢：保持 40/60，调整确认在版本守卫处失败并整体回滚，方案仍为待确认。
+            assertThat(after.get(0).getPlannedAmount()).isEqualByComparingTo("40");
+            assertThat(after.get(1).getPlannedAmount()).isEqualByComparingTo("60");
+            assertThat(reloaded.getTotalDisbursed()).isEqualByComparingTo("40");
+            assertThat(adjustmentRepository.findById(adjustment.getId()).orElseThrow().getStatus())
+                    .isEqualTo(com.chris64233.granttranche.domain.AdjustmentStatus.PROPOSED);
+            // 拨款已占用调出期次，旧方案再确认时按最新状态判定不可沿用并作废。
+            assertThatThrownBy(() -> grantService.confirmAdjustment(adjustment.getId(), "approver"))
+                    .isInstanceOf(BusinessRuleException.class);
+            assertThat(adjustmentRepository.findById(adjustment.getId()).orElseThrow().getStatus())
+                    .isEqualTo(com.chris64233.granttranche.domain.AdjustmentStatus.INVALIDATED);
+        } else {
+            // 调整赢：30/70，拨款失败未占用额度。
+            assertThat(after.get(0).getPlannedAmount()).isEqualByComparingTo("30");
+            assertThat(after.get(1).getPlannedAmount()).isEqualByComparingTo("70");
+            assertThat(reloaded.getTotalDisbursed()).isEqualByComparingTo("0");
+            assertThat(adjustmentRepository.findById(adjustment.getId()).orElseThrow().getStatus())
+                    .isEqualTo(com.chris64233.granttranche.domain.AdjustmentStatus.CONFIRMED);
+        }
     }
 }

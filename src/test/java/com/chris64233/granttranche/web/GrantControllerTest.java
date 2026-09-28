@@ -218,6 +218,124 @@ class GrantControllerTest {
     }
 
     @Test
+    void budgetAdjustmentRequestConfirmAndQueryThroughHttp() throws Exception {
+        long projectId = createProject("W-ADJ", "100",
+                List.of(trancheSpec(1, "40", "中期报告"), trancheSpec(2, "60", "结题报告")));
+        MvcResult tranchesResult = mockMvc.perform(get("/api/projects/{id}/tranches", projectId))
+                .andExpect(status().isOk()).andReturn();
+        long t1 = objectMapper.readTree(tranchesResult.getResponse().getContentAsString()).get(0).get("id").asLong();
+        long t2 = objectMapper.readTree(tranchesResult.getResponse().getContentAsString()).get(1).get("id").asLong();
+
+        // 申请调整：第一期 40 → 30，第二期 60 → 70。
+        MvcResult reqResult = mockMvc.perform(post("/api/projects/adjustments")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"fromTrancheId": %d, "toTrancheId": %d, "amount": 10,
+                                 "businessNo": "W-ADJ-1", "reason": "研究节奏后移",
+                                 "requestedBy": "manager-qian"}
+                                """.formatted(t1, t2)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("PROPOSED"))
+                .andExpect(jsonPath("$.fromAmountBefore").value(40))
+                .andExpect(jsonPath("$.toAmountBefore").value(60))
+                .andReturn();
+        long adjustmentId = objectMapper.readTree(reqResult.getResponse().getContentAsString()).get("id").asLong();
+
+        // 申请阶段金额未变。
+        mockMvc.perform(get("/api/projects/{id}/tranches", projectId))
+                .andExpect(jsonPath("$[0].plannedAmount").value(40))
+                .andExpect(jsonPath("$[1].plannedAmount").value(60));
+
+        // 申请幂等：同业务号原样返回同一方案。
+        mockMvc.perform(post("/api/projects/adjustments")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"fromTrancheId": %d, "toTrancheId": %d, "amount": 10,
+                                 "businessNo": "W-ADJ-1", "reason": "重复",
+                                 "requestedBy": "manager-qian"}
+                                """.formatted(t1, t2)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.id").value(adjustmentId));
+
+        // 确认调整。
+        mockMvc.perform(post("/api/projects/adjustments/{id}/confirm", adjustmentId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"confirmedBy": "approver-wang"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CONFIRMED"))
+                .andExpect(jsonPath("$.confirmedBy").value("approver-wang"))
+                .andExpect(jsonPath("$.fromAmountAfter").value(30))
+                .andExpect(jsonPath("$.toAmountAfter").value(70));
+
+        // 两期次等额转移，项目总额与可拨余额不变。
+        mockMvc.perform(get("/api/projects/{id}/tranches", projectId))
+                .andExpect(jsonPath("$[0].plannedAmount").value(30))
+                .andExpect(jsonPath("$[1].plannedAmount").value(70));
+        mockMvc.perform(get("/api/projects/{id}/balance", projectId))
+                .andExpect(jsonPath("$.approvedAmount").value(100))
+                .andExpect(jsonPath("$.availableBalance").value(100));
+
+        // 调整留痕可查。
+        mockMvc.perform(get("/api/projects/{id}/adjustments", projectId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", hasSize(1)))
+                .andExpect(jsonPath("$[0].businessNo").value("W-ADJ-1"))
+                .andExpect(jsonPath("$[0].reason").value("研究节奏后移"));
+    }
+
+    @Test
+    void adjustmentOfDisbursedTrancheAndSuspensionAreRejected() throws Exception {
+        long projectId = createProject("W-ADJBLK", "100",
+                List.of(trancheSpec(1, "40", "中期报告"), trancheSpec(2, "60", "结题报告")));
+        MvcResult tranchesResult = mockMvc.perform(get("/api/projects/{id}/tranches", projectId))
+                .andExpect(status().isOk()).andReturn();
+        long t1 = objectMapper.readTree(tranchesResult.getResponse().getContentAsString()).get(0).get("id").asLong();
+        long t2 = objectMapper.readTree(tranchesResult.getResponse().getContentAsString()).get(1).get("id").asLong();
+
+        // 提交、验收、拨款第一期。
+        mockMvc.perform(post("/api/projects/tranches/{id}/submit", t1)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"evidence": "报告", "submittedBy": "pi-zhang"}
+                                """))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/projects/tranches/{id}/review", t1)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"approved": true, "reviewedBy": "reviewer-li", "comment": "通过"}
+                                """))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/projects/tranches/{id}/disburse", t1)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"businessNo": "W-ADJBLK-D", "approvedBy": "approver-wang", "reason": "第一期"}
+                                """))
+                .andExpect(status().isOk());
+
+        // 已拨付期次不能调整 → 409。
+        mockMvc.perform(post("/api/projects/adjustments")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"fromTrancheId": %d, "toTrancheId": %d, "amount": 10,
+                                 "businessNo": "W-ADJBLK-1", "reason": "r",
+                                 "requestedBy": "m"}
+                                """.formatted(t1, t2)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("不得调整")));
+
+        // 参数校验失败 → 400。
+        mockMvc.perform(post("/api/projects/adjustments")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"fromTrancheId": %d, "toTrancheId": %d, "amount": 0,
+                                 "businessNo": "", "reason": "r", "requestedBy": "m"}
+                                """.formatted(t1, t2)))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
     void unknownProjectReturns404() throws Exception {
         mockMvc.perform(get("/api/projects/99999/balance"))
                 .andExpect(status().isNotFound())
