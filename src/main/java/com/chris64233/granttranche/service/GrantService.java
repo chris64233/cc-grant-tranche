@@ -1,26 +1,32 @@
 package com.chris64233.granttranche.service;
 
+import com.chris64233.granttranche.domain.BudgetAdjustment;
+import com.chris64233.granttranche.domain.AdjustmentStatus;
 import com.chris64233.granttranche.domain.ComplianceSuspension;
 import com.chris64233.granttranche.domain.FundRecord;
 import com.chris64233.granttranche.domain.FundRecordType;
 import com.chris64233.granttranche.domain.GrantProject;
 import com.chris64233.granttranche.domain.GrantTranche;
 import com.chris64233.granttranche.domain.TrancheStatus;
+import com.chris64233.granttranche.dto.AdjustmentView;
 import com.chris64233.granttranche.dto.CreateProjectRequest;
 import com.chris64233.granttranche.dto.FundRecordView;
 import com.chris64233.granttranche.dto.ProjectBalance;
 import com.chris64233.granttranche.dto.SuspensionView;
 import com.chris64233.granttranche.dto.TrancheView;
+import com.chris64233.granttranche.repo.BudgetAdjustmentRepository;
 import com.chris64233.granttranche.repo.ComplianceSuspensionRepository;
 import com.chris64233.granttranche.repo.FundRecordRepository;
 import com.chris64233.granttranche.repo.GrantProjectRepository;
 import com.chris64233.granttranche.repo.GrantTrancheRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -29,11 +35,12 @@ import java.util.Set;
  * 分期拨款核心业务服务。
  *
  * <p><b>并发模型：</b>所有改变项目额度或一致性状态的操作（验收、合规暂停/解除、拨款批准、
- * 支付、撤销、追回）都在事务内以悲观写锁锁定项目行后执行，因此同一项目的并发决定被严格串行化，
- * 只会形成一种一致结果；累计拨款额在锁内原子增减，任何并发组合都无法突破批准总额。
+ * 支付、撤销、追回、预算调整确认）都在事务内以悲观写锁锁定项目行后执行，因此同一项目的并发决定
+ * 被严格串行化，只会形成一种一致结果；累计拨款额在锁内原子增减，任何并发组合都无法突破批准总额。
+ * 拨款确认与预算调整确认额外通过项目版本裁决，真正并发重叠时恰好一个成功。
  *
- * <p><b>幂等：</b>拨款与追回以调用方提供的业务号为幂等键（数据库唯一约束兜底），
- * 重复提交返回原始记录，不重复占用额度。
+ * <p><b>幂等：</b>拨款、追回与预算调整以调用方提供的业务号为幂等键（数据库唯一约束兜底），
+ * 重复提交返回原始记录，不重复占用额度、不重复转移金额。
  */
 @Service
 public class GrantService {
@@ -42,17 +49,26 @@ public class GrantService {
     private final GrantTrancheRepository trancheRepository;
     private final FundRecordRepository fundRecordRepository;
     private final ComplianceSuspensionRepository suspensionRepository;
+    private final BudgetAdjustmentRepository adjustmentRepository;
+    /** 独立提交事务：当前业务事务因校验失败即将回滚时，用它把方案作废决定单独落库留痕。 */
+    private final TransactionTemplate requiresNewTransactionTemplate;
     private final Clock clock;
 
     public GrantService(GrantProjectRepository projectRepository,
                         GrantTrancheRepository trancheRepository,
                         FundRecordRepository fundRecordRepository,
                         ComplianceSuspensionRepository suspensionRepository,
+                        BudgetAdjustmentRepository adjustmentRepository,
+                        org.springframework.transaction.PlatformTransactionManager transactionManager,
                         Clock clock) {
         this.projectRepository = projectRepository;
         this.trancheRepository = trancheRepository;
         this.fundRecordRepository = fundRecordRepository;
         this.suspensionRepository = suspensionRepository;
+        this.adjustmentRepository = adjustmentRepository;
+        this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
+        this.requiresNewTransactionTemplate.setPropagationBehavior(
+                org.springframework.transaction.TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.clock = clock;
     }
 
@@ -148,12 +164,28 @@ public class GrantService {
     // 合规暂停
     // ------------------------------------------------------------------
 
-    /** 发起合规暂停。存在活动暂停期间，任何期次拨款都不得批准。 */
+    /**
+     * 发起合规暂停。存在活动暂停期间，任何期次拨款都不得批准，预算调整也不得确认。
+     *
+     * <p>暂停在同一事务内把项目内所有待确认(PROPOSED)的预算调整方案作 INVALIDATED 处理：
+     * 合规暂停意味着申请依据已变化，恢复后必须重新检查期次状态与余额并重新申请，
+     * 旧方案不能直接沿用。项目版本同时强制递增，与并发的拨款确认/调整确认只可能有一方成功。
+     */
     @Transactional
     public ComplianceSuspension suspend(Long projectId, String reason, String raisedBy) {
         GrantProject project = lockProject(projectId);
         if (suspensionRepository.existsByProjectIdAndActiveTrue(projectId)) {
             throw new BusinessRuleException("项目已存在活动中的合规暂停");
+        }
+        List<BudgetAdjustment> pending = adjustmentRepository
+                .findByProjectIdAndStatus(projectId, AdjustmentStatus.PROPOSED);
+        for (BudgetAdjustment adjustment : pending) {
+            adjustment.markInvalidated("合规暂停（%s），旧调整方案作废，恢复后须重新申请".formatted(reason), now());
+            adjustmentRepository.save(adjustment);
+        }
+        // 暂停本身不改金额字段，显式推进项目版本，使并发、依据旧版本的拨款/调整确认落败。
+        if (projectRepository.bumpVersionIfMatches(projectId, project.getVersion()) != 1) {
+            throw new BusinessRuleException("项目状态已被并发事务改变，合规暂停失败，请重试");
         }
         return suspensionRepository.save(new ComplianceSuspension(project, reason, raisedBy, now()));
     }
@@ -194,14 +226,25 @@ public class GrantService {
             return sameDisbursementOrConflict(existing, trancheId, businessNo);
         }
 
-        GrantTranche tranche = getTranche(trancheId);
-        GrantProject project = lockProject(tranche.getProject().getId());
+        Long projectId = trancheRepository.findProjectIdById(trancheId)
+                .orElseThrow(() -> new NotFoundException("拨款期次不存在: " + trancheId));
+        // 加锁前快照项目版本：与并发的预算调整确认通过项目版本裁决，持锁后版本若已变则本方落败（409）。
+        Long versionBeforeLock = projectRepository.findVersionById(projectId)
+                .orElseThrow(() -> new NotFoundException("项目不存在: " + projectId));
+        GrantProject project = lockProject(projectId);
 
-        // 锁内复查，防止与并发事务竞争同一业务号。
+        // 锁内先做幂等复查：同业务号的重复提交即使在锁等待期间项目已变化，也原样返回同一笔，
+        // 不能被版本守卫误判为冲突。
         existing = fundRecordRepository.findByBusinessNo(businessNo).orElse(null);
         if (existing != null) {
             return sameDisbursementOrConflict(existing, trancheId, businessNo);
         }
+
+        // 全新拨款：持锁后版本若已变，说明与并发的调整确认/拨款竞争，本方落败。
+        assertVersionUnchangedSinceLock(projectId, versionBeforeLock, "拨款确认");
+        // 期次在加锁通过守卫之后才加载：持项目行锁期间读到的状态与计划金额必然是最新提交值
+        //（例如已由预算调整改为新金额，拨款按调整后金额占用额度），无需 refresh。
+        GrantTranche tranche = getTranche(trancheId);
 
         if (tranche.getStatus() != TrancheStatus.ACCEPTED) {
             throw new BusinessRuleException("仅验收通过(ACCEPTED)的期次可批准拨款，当前状态: " + tranche.getStatus());
@@ -347,6 +390,220 @@ public class GrantService {
     }
 
     // ------------------------------------------------------------------
+    // 未拨付预算的期次间调整
+    // ------------------------------------------------------------------
+
+    /** 尚未拨付的期次状态：只有这些期次的计划金额允许被调整。 */
+    private static final Set<TrancheStatus> UNDISBURSED =
+            EnumSet.of(TrancheStatus.PLANNED, TrancheStatus.SUBMITTED,
+                    TrancheStatus.REJECTED, TrancheStatus.ACCEPTED);
+
+    /**
+     * 申请未拨付预算在两个未来期次之间调整（只登记方案与快照，不改变任何金额）。
+     *
+     * <p>规则：
+     * <ul>
+     *   <li>调出与调入期次必须属于同一项目且为期次不同；</li>
+     *   <li>两个期次都必须是尚未拨付状态——已支付、正在拨付（已批准未支付）或其拨款已用于追回
+     *       的期次一律不允许调出/调入，相关金额保留在原期次与原用途；</li>
+     *   <li>调整金额必须为正，且不得超过调出期次当前计划金额（项目尚未使用的部分）；</li>
+     *   <li>调整为等额转移，项目批准总额、累计拨款均不变。</li>
+     * </ul>
+     * 业务号重复提交原样返回同一方案，保证幂等；业务号被资金记录占用返回冲突。
+     */
+    @Transactional
+    public BudgetAdjustment requestAdjustment(Long fromTrancheId, Long toTrancheId,
+                                              BigDecimal amount, String businessNo,
+                                              String reason, String requestedBy) {
+        BudgetAdjustment existing = adjustmentRepository.findByBusinessNo(businessNo).orElse(null);
+        if (existing != null) {
+            return sameAdjustmentOrConflict(existing, fromTrancheId, toTrancheId, amount, businessNo);
+        }
+        if (fundRecordRepository.findByBusinessNo(businessNo).isPresent()) {
+            throw new BusinessRuleException("业务号已被其他资金记录占用: " + businessNo);
+        }
+
+        GrantTranche from = getTranche(fromTrancheId);
+        GrantTranche to = getTranche(toTrancheId);
+        GrantProject project = lockProject(from.getProject().getId());
+
+        // 锁内复查业务号，防止与并发申请竞争。
+        existing = adjustmentRepository.findByBusinessNo(businessNo).orElse(null);
+        if (existing != null) {
+            return sameAdjustmentOrConflict(existing, fromTrancheId, toTrancheId, amount, businessNo);
+        }
+        if (fundRecordRepository.findByBusinessNo(businessNo).isPresent()) {
+            throw new BusinessRuleException("业务号已被其他资金记录占用: " + businessNo);
+        }
+
+        if (!from.getProject().getId().equals(to.getProject().getId())) {
+            throw new BusinessRuleException("调出与调入期次必须属于同一个项目");
+        }
+        if (from.getId().equals(to.getId())) {
+            throw new BusinessRuleException("调出期次与调入期次不能相同");
+        }
+        assertUndisbursed(from, "调出");
+        assertUndisbursed(to, "调入");
+        if (amount == null || amount.signum() <= 0) {
+            throw new BusinessRuleException("调整金额必须为正数");
+        }
+        if (amount.compareTo(from.getPlannedAmount()) > 0) {
+            throw new BusinessRuleException(
+                    "调整金额 %s 超过调出期次尚未拨付的计划金额 %s".formatted(
+                            amount, from.getPlannedAmount()));
+        }
+
+        return initializeForView(adjustmentRepository.save(new BudgetAdjustment(
+                businessNo, project, from, to, amount, reason, requestedBy, now(), project.getVersion())));
+    }
+
+    /** 幂等命中：业务号对应同一调整（期次与金额一致）则返回，否则冲突。 */
+    private BudgetAdjustment sameAdjustmentOrConflict(BudgetAdjustment existing, Long fromTrancheId,
+                                                      Long toTrancheId, BigDecimal amount, String businessNo) {
+        boolean same = fromTrancheId.equals(existing.getFromTranche().getId())
+                && toTrancheId.equals(existing.getToTranche().getId())
+                && amount.compareTo(existing.getAmount()) == 0;
+        if (!same) {
+            throw new BusinessRuleException("业务号已被其他调整记录占用: " + businessNo);
+        }
+        return initializeForView(existing);
+    }
+
+    private void assertUndisbursed(GrantTranche tranche, String role) {
+        if (!UNDISBURSED.contains(tranche.getStatus())) {
+            throw new BusinessRuleException(
+                    "%s期次 %d 已进入拨付/支付环节（%s），其金额不得调整".formatted(
+                            role, tranche.getSequenceNo(), tranche.getStatus()));
+        }
+    }
+
+    /**
+     * 确认调整。确认时（而非申请时）对方案依据做<b>全量重新检查</b>：
+     * <ol>
+     *   <li>项目没有活动中的合规暂停——暂停期间不得确认；</li>
+     *   <li>方案未被作废（暂停发生时待确认方案会被置为 INVALIDATED）；</li>
+     *   <li>两个期次仍为未拨付状态——申请后任一期次被拨款，旧方案立即失效；</li>
+     *   <li>两期次当前计划金额仍等于申请时快照（未被其他已确认调整改变），且调整额仍不超过调出余额。</li>
+     * </ol>
+     *
+     * <p>通过检查后在同一事务、同一项目行锁内：项目版本 +1、调出期次减额、调入期次等额增额、
+     * 方案置 CONFIRMED 并记录批准人与调整前后金额；任一步失败整体回滚，不产生半成功状态。
+     *
+     * <p><b>与拨款确认并发：</b>进入时先快照项目版本、再申请项目行悲观锁，获锁后比对版本。
+     * 若重叠的拨款（或支付/撤销/追回/暂停/另一调整确认）已先提交并推进版本，则本确认判定为
+     * 并发竞争落败方，收到业务冲突（409）；本确认提交时自身也会推进版本，使后提交的拨款落败。
+     * 因此拨款确认与预算调整真正并发时恰好只允许一个成功；两者不重叠（先后发生）时互不影响。
+     *
+     * <p>幂等：重复确认已确认方案原样返回，不重复转移金额。
+     */
+    @Transactional
+    public BudgetAdjustment confirmAdjustment(Long adjustmentId, String confirmedBy) {
+        Long projectId = adjustmentRepository.findProjectIdById(adjustmentId)
+                .orElseThrow(() -> new NotFoundException("预算调整记录不存在: " + adjustmentId));
+        // 加锁前快照项目版本：与持锁后版本比对，裁决与拨款确认的并发竞争。
+        Long versionBeforeLock = projectRepository.findVersionById(projectId)
+                .orElseThrow(() -> new NotFoundException("项目不存在: " + projectId));
+        GrantProject project = lockProject(projectId);
+
+        // 方案在持锁之后才加载：锁等待期间若被暂停作废或由另一请求确认，这里读到的都是最新状态。
+        BudgetAdjustment adjustment = getAdjustment(adjustmentId);
+
+        // 幂等复查优先于版本守卫：重复确认已完成方案直接返回，已作废方案直接报错，
+        // 不被锁等待期间其他事务的版本推进误判为并发冲突。
+        if (adjustment.getStatus() == AdjustmentStatus.CONFIRMED) {
+            return initializeForView(adjustment);
+        }
+        if (adjustment.getStatus() == AdjustmentStatus.INVALIDATED) {
+            throw new BusinessRuleException("调整方案已作废（%s），不能确认，请重新申请"
+                    .formatted(adjustment.getInvalidatedReason()));
+        }
+
+        // 待确认方案：持锁后版本若已变，说明与并发的拨款/暂停/另一调整竞争，本方落败。
+        assertVersionUnchangedSinceLock(projectId, versionBeforeLock, "预算调整确认");
+
+        // 期次同样在持锁后经懒加载读取，状态与计划金额为最新提交值，无需 refresh。
+        GrantTranche from = adjustment.getFromTranche();
+        GrantTranche to = adjustment.getToTranche();
+
+        String invalidReason = revalidate(from, to, adjustment);
+        if (invalidReason != null) {
+            // 作废必须落库后再向调用方报错，使用独立事务提交，避免随当前失败事务一起回滚。
+            invalidateInSeparateTransaction(adjustmentId, invalidReason);
+            throw new BusinessRuleException(invalidReason + "，旧调整方案已作废，请重新申请");
+        }
+
+        BigDecimal fromAfter = from.getPlannedAmount().subtract(adjustment.getAmount());
+        BigDecimal toAfter = to.getPlannedAmount().add(adjustment.getAmount());
+        from.setPlannedAmount(fromAfter);
+        to.setPlannedAmount(toAfter);
+        adjustment.markConfirmed(confirmedBy, fromAfter, toAfter, now());
+
+        // 两个期次与方案先落库；@Modifying 默认 flushAutomatically，版本递增语句执行前会先刷这些更新，
+        // 与最后的 UPDATE 处于同一事务，任一失败整体回滚。持行锁条件更新正常返回 1。
+        trancheRepository.save(from);
+        trancheRepository.save(to);
+        adjustmentRepository.save(adjustment);
+        if (projectRepository.bumpVersionIfMatches(projectId, project.getVersion()) != 1) {
+            throw new BusinessRuleException("项目状态已被并发事务改变，预算调整确认失败，请重试");
+        }
+        return initializeForView(adjustment);
+    }
+
+    /** 重新检查暂停、期次状态与余额快照；返回 null 表示全部通过，否则返回失效原因。 */
+    private String revalidate(GrantTranche from, GrantTranche to, BudgetAdjustment adjustment) {
+        if (suspensionRepository.existsByProjectIdAndActiveTrue(adjustment.getProject().getId())) {
+            return "项目存在活动中的合规暂停";
+        }
+        if (!UNDISBURSED.contains(from.getStatus())) {
+            return "调出期次 %d 已进入拨付/支付环节（%s）".formatted(from.getSequenceNo(), from.getStatus());
+        }
+        if (!UNDISBURSED.contains(to.getStatus())) {
+            return "调入期次 %d 已进入拨付/支付环节（%s）".formatted(to.getSequenceNo(), to.getStatus());
+        }
+        if (from.getPlannedAmount().compareTo(adjustment.getFromAmountBefore()) != 0
+                || to.getPlannedAmount().compareTo(adjustment.getToAmountBefore()) != 0) {
+            return "期次计划金额自申请后已发生变化";
+        }
+        if (adjustment.getAmount().compareTo(from.getPlannedAmount()) > 0) {
+            return "调整金额超过调出期次当前尚未拨付的余额";
+        }
+        return null;
+    }
+
+    /**
+     * 加锁后版本守卫：持锁后版本若与加锁前快照不同，说明有重叠事务已先提交，
+     * 当前操作为并发竞争落败方，抛出业务冲突（由调用方作为 409 返回），不产生半成功状态。
+     */
+    private void assertVersionUnchangedSinceLock(Long projectId, Long versionBeforeLock, String operation) {
+        Long current = projectRepository.findVersionById(projectId)
+                .orElseThrow(() -> new NotFoundException("项目不存在: " + projectId));
+        if (!current.equals(versionBeforeLock)) {
+            throw new BusinessRuleException(
+                    "项目在%s等待期间已被并发事务修改（版本 %d → %d），本次%s失败，请重试"
+                            .formatted(operation, versionBeforeLock, current, operation));
+        }
+    }
+
+    /** 在独立事务中把方案置为 INVALIDATED 并提交，使其在当前业务事务回滚后仍然留痕。 */
+    private void invalidateInSeparateTransaction(Long adjustmentId, String reason) {
+        requiresNewTransactionTemplate.executeWithoutResult(status -> {
+            BudgetAdjustment fresh = adjustmentRepository.findById(adjustmentId).orElse(null);
+            if (fresh != null && fresh.getStatus() == AdjustmentStatus.PROPOSED) {
+                fresh.markInvalidated(reason, now());
+            }
+        });
+    }
+
+    /** 项目的全部预算调整记录，新的在前。 */
+    @Transactional(readOnly = true)
+    public List<AdjustmentView> listAdjustments(Long projectId) {
+        getProject(projectId);
+        return adjustmentRepository.findByProjectIdOrderByIdDesc(projectId).stream()
+                .map(GrantService::toAdjustmentView)
+                .toList();
+    }
+
+    // ------------------------------------------------------------------
     // 查询
     // ------------------------------------------------------------------
 
@@ -416,6 +673,23 @@ public class GrantService {
                 .orElseThrow(() -> new NotFoundException("资金记录不存在: " + id));
     }
 
+    private BudgetAdjustment getAdjustment(Long id) {
+        return adjustmentRepository.findById(id)
+                .orElseThrow(() -> new NotFoundException("预算调整记录不存在: " + id));
+    }
+
+    /**
+     * 在事务内初始化调整记录的懒加载关联（项目、调出/调入期次）。
+     * 应用关闭了 open-in-view，Controller 在事务提交后才把实体转成视图，
+     * 因此所有返回路径（含幂等早返回）都必须在事务内把这些关联加载好，避免 LazyInitializationException。
+     */
+    private BudgetAdjustment initializeForView(BudgetAdjustment adjustment) {
+        org.hibernate.Hibernate.initialize(adjustment.getProject());
+        org.hibernate.Hibernate.initialize(adjustment.getFromTranche());
+        org.hibernate.Hibernate.initialize(adjustment.getToTranche());
+        return adjustment;
+    }
+
     public static TrancheView toTrancheView(GrantTranche t) {
         return new TrancheView(t.getId(), t.getSequenceNo(), t.getPlannedAmount(),
                 t.getRequiredDeliverable(), t.getBudgetConditions(), t.getStatus(),
@@ -430,5 +704,16 @@ public class GrantService {
                 r.getAmount(), r.getStatus(), r.getRecoveredAmount(), r.getCreatedBy(), r.getCreatedAt(),
                 r.getReason(), r.getPaidAt(), r.getPaidBy(), r.getRevokedAt(), r.getRevokedBy(),
                 r.getRevokeReason());
+    }
+
+    public static AdjustmentView toAdjustmentView(BudgetAdjustment a) {
+        return new AdjustmentView(a.getId(), a.getBusinessNo(), a.getProject().getId(),
+                a.getFromTranche().getId(), a.getFromTranche().getSequenceNo(),
+                a.getToTranche().getId(), a.getToTranche().getSequenceNo(),
+                a.getAmount(), a.getStatus(), a.getReason(), a.getRequestedBy(), a.getRequestedAt(),
+                a.getConfirmedBy(), a.getConfirmedAt(),
+                a.getFromAmountBefore(), a.getFromAmountAfter(),
+                a.getToAmountBefore(), a.getToAmountAfter(),
+                a.getProjectVersion(), a.getInvalidatedReason(), a.getInvalidatedAt());
     }
 }

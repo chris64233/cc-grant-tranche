@@ -1,6 +1,9 @@
 package com.chris64233.granttranche.web;
 
 import com.chris64233.granttranche.domain.GrantProject;
+import com.chris64233.granttranche.dto.AdjustmentRequest;
+import com.chris64233.granttranche.dto.AdjustmentView;
+import com.chris64233.granttranche.dto.ConfirmAdjustmentRequest;
 import com.chris64233.granttranche.dto.CreateProjectRequest;
 import com.chris64233.granttranche.dto.FundRecordView;
 import com.chris64233.granttranche.dto.LiftSuspensionRequest;
@@ -77,6 +80,12 @@ public class GrantController {
         return grantService.listFundRecords(projectId);
     }
 
+    /** 预算调整记录（申请、确认、作废全量留痕，新的在前）。 */
+    @GetMapping("/{projectId}/adjustments")
+    public List<AdjustmentView> adjustments(@PathVariable Long projectId) {
+        return grantService.listAdjustments(projectId);
+    }
+
     @PostMapping("/tranches/{trancheId}/submit")
     public TrancheView submit(@PathVariable Long trancheId,
                               @Valid @RequestBody SubmitDeliverableRequest request) {
@@ -133,5 +142,22 @@ public class GrantController {
         return GrantService.toFundRecordView(grantService.recover(
                 fundRecordId, request.businessNo(), request.amount(),
                 request.recoveredBy(), request.reason()));
+    }
+
+    /** 申请未拨付预算在两个未来期次之间调整（只登记方案，不改变金额；businessNo 幂等）。 */
+    @PostMapping("/adjustments")
+    @ResponseStatus(HttpStatus.CREATED)
+    public AdjustmentView requestAdjustment(@Valid @RequestBody AdjustmentRequest request) {
+        return GrantService.toAdjustmentView(grantService.requestAdjustment(
+                request.fromTrancheId(), request.toTrancheId(), request.amount(),
+                request.businessNo(), request.reason(), request.requestedBy()));
+    }
+
+    /** 确认调整：重新检查暂停/期次状态/余额后，在同一事务内等额转移两个期次的计划金额。 */
+    @PostMapping("/adjustments/{adjustmentId}/confirm")
+    public AdjustmentView confirmAdjustment(@PathVariable Long adjustmentId,
+                                            @Valid @RequestBody ConfirmAdjustmentRequest request) {
+        return GrantService.toAdjustmentView(
+                grantService.confirmAdjustment(adjustmentId, request.confirmedBy()));
     }
 }
